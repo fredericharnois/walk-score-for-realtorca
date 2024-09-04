@@ -1,158 +1,126 @@
-document.addEventListener('DOMContentLoaded', function () {
-    console.log("Popup DOM fully loaded");
+document.addEventListener('DOMContentLoaded', initializePopup);
 
-    // Check if we have an API key, if not, show the input
-    chrome.storage.sync.get('walkScoreApiKey', function (data) {
-        if (!data.walkScoreApiKey) {
-            document.getElementById('apiKeyInput').style.display = 'block';
+function initializePopup() {
+    chrome.storage.sync.get(['walkScoreApiKey', 'mapboxApiKey'], function (data) {
+        if (!data.walkScoreApiKey || !data.mapboxApiKey) {
+            showApiKeyInput();
         } else {
-            fetchScores();
+            checkUrlAndFetchScores();
         }
     });
 
-    // Add event listener for saving API key
-    document.getElementById('saveKey').addEventListener('click', function () {
-        const apiKey = document.getElementById('apiKey').value;
-        chrome.storage.sync.set({ walkScoreApiKey: apiKey }, function () {
-            console.log('Walk Score API key saved');
-            document.getElementById('apiKeyInput').style.display = 'none';
-            fetchScores();
-        });
+    document.getElementById('saveKeys').addEventListener('click', saveApiKeys);
+}
+
+function showApiKeyInput() {
+    document.getElementById('apiKeyInput').style.display = 'block';
+}
+
+function saveApiKeys() {
+    const walkScoreApiKey = document.getElementById('walkScoreApiKey').value;
+    const mapboxApiKey = document.getElementById('mapboxApiKey').value;
+    chrome.storage.sync.set({ walkScoreApiKey, mapboxApiKey }, function () {
+        document.getElementById('apiKeyInput').style.display = 'none';
+        checkUrlAndFetchScores();
     });
-});
+}
+
+function checkUrlAndFetchScores() {
+    chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+        if (tabs[0] && tabs[0].url.startsWith('https://www.realtor.ca/real-estate/')) {
+            fetchScores();
+        } else {
+            setElementText('scrapedAddress', 'Please navigate to a REALTOR.ca listing page.');
+        }
+    });
+}
 
 function fetchScores() {
-    console.log("fetchScores called");
     chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
-        console.log("Active tab query completed");
-        if (tabs[0]) {
-            chrome.tabs.sendMessage(tabs[0].id, { action: "getAddress" }, function (response) {
-                console.log("Received response from content script:", response);
-                if (chrome.runtime.lastError) {
-                    console.error("Error sending message:", chrome.runtime.lastError);
-                    setElementText('scrapedAddress', 'Error: ' + chrome.runtime.lastError.message + ' If on a REALTOR.ca listing page, please refresh.');
-                    return;
-                }
-                if (response && response.address) {
-                    setElementText('scrapedAddress', `Listing Address: ${response.address}`);
-                    const parsedAddress = parseAddress(response.address);
-                    console.log("Parsed address:", parsedAddress);
-                    if (parsedAddress) {
-                        // setElementText('parsedAddress', `Parsed Address: Street: ${parsedAddress.street}, City: ${parsedAddress.city}, State: ${parsedAddress.state}, Postal Code: ${parsedAddress.postalCode}`);
-                        getLatLong(parsedAddress)
-                            .then(coords => {
-                                console.log("Received coordinates:", coords);
-                                if (coords) {
-                                    fetchWalkScore(response.address, coords.lat, coords.lon);
-                                } else {
-                                    setElementText('scores', 'Error: Could not get coordinates for the address');
-                                }
-                            })
-                            .catch(error => {
-                                console.error("Error getting coordinates:", error);
-                                setElementText('scores', `Error getting coordinates: ${error.message}`);
-                            });
-                    } else {
-                        console.error("Failed to parse address");
-                        setElementText('scores', 'Error: Unable to parse the address');
-                    }
-                } else {
-                    console.error("Address not found in response");
-                    setElementText('scrapedAddress', 'Address not found on page');
-                }
-            });
-        } else {
-            console.error("No active tab found");
-            setElementText('scrapedAddress', 'Error: No active tab found');
-        }
+        chrome.tabs.sendMessage(tabs[0].id, { action: "getAddress" }, function (response) {
+            if (chrome.runtime.lastError) {
+                setElementText('scrapedAddress', 'Error: ' + chrome.runtime.lastError.message + ' If on a REALTOR.ca listing page, please refresh.');
+                return;
+            }
+            if (response && response.address) {
+                parseAddressAndGetCoords(response.address);
+            } else {
+                setElementText('scrapedAddress', 'Address not found on page');
+            }
+        });
     });
 }
 
-function setElementText(elementId, text) {
-    const element = document.getElementById(elementId);
-    if (element) {
-        element.textContent = text;
-    } else {
-        console.error(`Element with id '${elementId}' not found`);
-    }
+function parseAddressAndGetCoords(address) {
+    chrome.storage.sync.get('mapboxApiKey', function (data) {
+        const mapboxUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json?country=CA&limit=1&access_token=${data.mapboxApiKey}`;
+        fetch(mapboxUrl)
+            .then(response => response.json())
+            .then(data => {
+                if (data.features && data.features.length > 0) {
+                    const feature = data.features[0];
+                    const [lon, lat] = feature.center;
+                    const fullAddress = feature.place_name;
+                    displayStaticMap(lat, lon, fullAddress);
+                    displayFullAddress(fullAddress, lat, lon);
+                    fetchWalkScore(fullAddress, lat, lon);
+                } else {
+                    throw new Error('No results found for the address');
+                }
+            })
+            .catch(error => {
+                setElementText('scores', `Error: ${error.message}`);
+            });
+    });
 }
 
-function parseAddress(address) {
-    console.log("Parsing address:", address);
-    const regex = /^([^,]+)(?:,\s*#\d+)?\s*,\s*([^\(,]+)\s*(?:\([^\)]+\))?,\s*([^,]+)\s*[A-Z]\d[A-Z]\d[A-Z]\d/;
-    const match = address.match(regex);
-    console.log(match);
-
-    if (match) {
-        return {
-            street: match[1].replace("O.", "Ouest").replace("E.", "Est").trim(),
-            city: match[2].trim(),
-            state: match[3].trim()
-        };
-    } else {
-        console.error('Unable to parse address:', address);
-        return null;
-    }
+function displayStaticMap(lat, lon, fullAddress) {
+    chrome.storage.sync.get('mapboxApiKey', function (data) {
+        const mapUrl = `https://api.mapbox.com/styles/v1/mapbox/streets-v11/static/pin-s+ff0000(${lon},${lat})/${lon},${lat},15/300x200@2x?access_token=${data.mapboxApiKey}`;
+        const googleMapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fullAddress)}`;
+        document.getElementById('mapContainer').innerHTML = `
+            <a href="${googleMapsUrl}" target="_blank">
+                <img src="${mapUrl}" alt="Map of the location" style="width: 100%; height: auto;">
+            </a>
+        `;
+    });
 }
 
-function getLatLong(parsedAddress) {
-    console.log("getLatLong called with:", parsedAddress);
-    const { street, city, state } = parsedAddress;
-    const nominatimUrl = `https://nominatim.openstreetmap.org/search?format=json&street=${encodeURIComponent(street)}&city=${encodeURIComponent(city)}&state=${encodeURIComponent(state)}&country=Canada`;
-    // document.getElementById('nominatimUrl').textContent = `Nominatim URL: ${nominatimUrl}`;
-    // console.log("Nominatim URL:", nominatimUrl);
-
-    return fetch(nominatimUrl)
-        .then(response => response.json())
-        .then(data => {
-            console.log("Nominatim response:", data);
-            if (data && data.length > 0) {
-                return { lat: data[0].lat, lon: data[0].lon };
-            } else {
-                throw new Error('No coordinates found for the address');
-            }
-        });
+function displayFullAddress(fullAddress, lat, lon) {
+    const googleMapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fullAddress)}`;
+    setElementText('scrapedAddress', `<a href="${googleMapsUrl}" target="_blank">${fullAddress}</a>`, true);
 }
 
 function fetchWalkScore(address, lat, lon) {
-    console.log("fetchWalkScore called with:", address, lat, lon);
-
-    // Retrieve the API key from storage
     chrome.storage.sync.get('walkScoreApiKey', function (data) {
-        if (data.walkScoreApiKey) {
-            const apiKey = data.walkScoreApiKey;
-            const walkScoreUrl = `https://api.walkscore.com/score?format=json&address=${encodeURIComponent(address)}&lat=${lat}&lon=${lon}&transit=1&bike=1&wsapikey=${apiKey}`;
-
-            // console.log("Walk Score API URL:", walkScoreUrl);
-
-            fetch(walkScoreUrl)
-                .then(response => response.json())
-                .then(data => {
-                    console.log("Walk Score API response:", data);
-
-                    if (data.status === 1) { // 1 means success
-                        let scoresHtml = `<p><a href="https://www.walkscore.com/how-it-works/">Walk Score®</a>: <a href="https://www.walkscore.com/how-it-works/">${data.walkscore}</a></p>`;
-
-                        if (data.bike) {
-                            scoresHtml += `<p><a href="https://www.walkscore.com/how-it-works/">Bike Score®</a>: <a href="https://www.walkscore.com/how-it-works/">${data.bike.score}</a></p>`;
-                        }
-
-                        if (data.transit) {
-                            scoresHtml += `<p><a href="https://www.walkscore.com/how-it-works/">Transit Score®</a>: <a href="https://www.walkscore.com/how-it-works/">${data.transit.score}</a></p>`;
-                        }
-
-                        document.getElementById('scores').innerHTML = scoresHtml;
-                    } else {
-                        throw new Error(`Walk Score API error: ${data.description}`);
-                    }
-                })
-                .catch(error => {
-                    console.error("Error fetching Walk Score:", error);
-                    document.getElementById('scores').textContent = `Error fetching Walk Score: ${error.message}`;
-                });
-        } else {
-            console.error("Walk Score API key not found");
-            document.getElementById('scores').textContent = 'Error: Walk Score API key not set';
-        }
+        const walkScoreUrl = `https://api.walkscore.com/score?format=json&address=${encodeURIComponent(address)}&lat=${lat}&lon=${lon}&transit=1&bike=1&wsapikey=${data.walkScoreApiKey}`;
+        fetch(walkScoreUrl)
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 1) {
+                    let scoresHtml = `
+                        <p><a href="https://www.walkscore.com/how-it-works/">Walk Score®</a>: <a href="https://www.walkscore.com/how-it-works/">${data.walkscore}</a></p>
+                        ${data.bike ? `<p><a href="https://www.walkscore.com/how-it-works/">Bike Score®</a>: <a href="https://www.walkscore.com/how-it-works/">${data.bike.score}</a></p>` : ''}
+                        ${data.transit ? `<p><a href="https://www.walkscore.com/how-it-works/">Transit Score®</a>: <a href="https://www.walkscore.com/how-it-works/">${data.transit.score}</a></p>` : ''}
+                    `;
+                    setElementText('scores', scoresHtml, true);
+                } else {
+                    throw new Error(`Walk Score API error: ${data.description}`);
+                }
+            })
+            .catch(error => {
+                setElementText('scores', `Error fetching Walk Score: ${error.message}`);
+            });
     });
+}
+
+function setElementText(elementId, content, isHTML = false) {
+    const element = document.getElementById(elementId);
+    if (element) {
+        if (isHTML) {
+            element.innerHTML = content;
+        } else {
+            element.textContent = content;
+        }
+    }
 }
